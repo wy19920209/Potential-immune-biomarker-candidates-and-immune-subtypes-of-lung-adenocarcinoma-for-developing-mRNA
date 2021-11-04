@@ -1,0 +1,254 @@
+#########################################################
+####1.Mutational patterns
+maf_LUAD <- GDCquery_Maf("LUAD", save.csv = FALSE, directory = "GDCdata", pipelines = "mutect2") 
+save(maf_LUAD, "maf_LUAD.RData")
+#Then perfoming NMF
+load("maf_BLCA.RData")
+maf <- read.maf(maf_LUAD, isTCGA = T)
+mut_mat <- trinucleotideMatrix(maf = maf, 
+                               ref_genome = "BSgenome.Hsapiens.UCSC.hg38",
+                               prefix = NULL, ignoreChr = NULL, 
+                               useSyn = T) %>% .$nmf_matrix %>% t()
+mut_mat <- mut_mat + 0.0001
+estimate <- nmf(mut_mat, rank=2:10, method="brunet", nrun=50, seed=123456)# 
+plot(estimate)
+pdf('NMF-rank.pdf',width = 8,height = 6)
+plot(estimate)
+dev.off()
+pdf('consensusmap.pdf',width = 15,height = 15,onefile = F)
+consensusmap(estimate,
+             annRow = NA,
+             annCol = NA,
+             main = "Consensus matrix",
+             info = FALSE)
+dev.off()
+nmf_res <- extract_signatures(mut_mat, rank = 4, nrun = 50)
+colnames(nmf_res$signatures) <- paste0("Signature", LETTERS[1:4])
+rownames(nmf_res$contribution) <- paste0("Signature", LETTERS[1:4])
+#cancer signature
+sp_url <- paste("https://cancer.sanger.ac.uk/cancergenome/assets/",
+                "signatures_probabilities.txt", sep = "")
+cancer_signatures = read.table(sp_url, sep = "\t", header = TRUE)
+new_order = match(row.names(mut_mat), cancer_signatures$Somatic.Mutation.Type)
+cancer_signatures = cancer_signatures[as.vector(new_order),]
+row.names(cancer_signatures) = cancer_signatures$Somatic.Mutation.Type
+cancer_signatures = as.matrix(cancer_signatures[,4:33])
+all(rownames(cancer_signatures) == rownames(nmf_res$signatures))
+cos_sim_signatures = cos_sim_matrix(nmf_res$signatures, cancer_signatures)
+#Compared with the published cosmoic database signature, then annotated mutation signature
+plot_cosine_heatmap(cos_sim_signatures,
+                    cluster_rows = FALSE, plot_values = T)
+#rename
+colnames(nmf_res$signatures) <- c("T>C", "APOBEC", "Age", "Tobacco")
+rownames(nmf_res$contribution) <- c("T>C", "APOBEC", "Age", "Tobacco")
+save(nmf_res, file = "nmf_res.RData")
+#Plot figure
+col <- pal_npg("nrc", alpha=0.7)(6) 
+names(col) <- c("C->T", "T->C", "C->A", "C->G", "T->A", "T->G")
+
+## Figure1
+
+signature.col <- c("red", "yellow", "darkorchid2","blue")
+names(signature.col) <- c("T>C", "APOBEC", "Age", "Tobacco")
+#mutation pattern输入数据准备
+Pattern_input <- function(mut_matrix){
+  CONTEXTS_96 <- rownames(mut_matrix)
+  substitution <- str_sub(rownames(mut_matrix), 3, 5)
+  substitution <- str_replace(substitution, ">", "->")
+  context = CONTEXTS_96
+  context = str_replace(context, "\\[.*]", "_")
+  df = data.frame(substitution = substitution, context = context)
+  df2 = cbind(df, as.data.frame(mut_matrix))
+  df3 = reshape2::melt(df2, id.vars = c("substitution", "context"))
+  return(df3)
+}
+pattern.dat <- Pattern_input(nmf_res$signatures)
+pattern.dat$variable <- factor(pattern.dat$variable,
+                               levels = c("T>C", "APOBEC", "Age", "Tobacco"))
+
+p1 <- ggplot(data = pattern.dat, aes(x = context, y = value, 
+                                     fill = substitution, width = 1)) + 
+  geom_bar(stat = "identity", colour = "black", size = 0.2) + 
+  scale_fill_manual(values = col) + 
+  facet_grid(variable ~ substitution, scales = "free_y") + ylab("Number of mutations \n ") + 
+  xlab("Motifs") +
+  # coord_cartesian(ylim = c(0, ymax)) + scale_y_continuous(breaks = seq(0, ymax, 0.1)) + 
+  guides(fill = FALSE) + theme_bw() + 
+  theme(axis.title.y = element_text(size = 12, vjust = 1), 
+        axis.text.y = element_text(size = 8), axis.title.x = element_text(size = 12), 
+        axis.text.x = element_text(size = 5, angle = 90, 
+                                   vjust = 0.4), strip.text.x = element_text(size = 9), 
+        strip.text.y = element_text(size = 9), panel.grid.major.x = element_blank(), 
+        panel.spacing.x = unit(0, "lines")) + 
+  ggtitle(paste0("Mutation signatures in ", ncol(nmf_res$contribution),
+                 " TCGA LUAD cancers")) + 
+  theme(plot.title = element_text(hjust = 0.5, size = rel(1.5)))
+## Figure 2
+order.sample <- getSampleSummary(maf) %>% as.data.frame() %>% .[, c("Tumor_Sample_Barcode", "total")] %>% .[order(.$total, decreasing = T), "Tumor_Sample_Barcode"] %>% as.character()
+contribution.input <- function(contribution, signatures, sampleindex = NULL, signatureindex = NULL, mode){
+  library(reshape2)
+  if (!(mode == "relative" | mode == "absolute")) 
+    stop("mode parameter should be either 'relative' or 'absolute'")
+  if (is.null(sampleindex)){
+    sampleindex = colnames(contribution)
+  }
+  if (is.null(signatureindex)){
+    signatureindex = rownames(contribution)
+  }
+  if (mode == "relative"){ 
+    contribution = contribution[signatureindex, sampleindex]
+    m_contribution = melt(contribution)
+    colnames(m_contribution) = c("Signature", "Sample", "Contribution")
+  }else {
+    if (missing(signatures))
+      stop(paste("For contribution plotting in mode 'absolute':", 
+                 "also provide signatures matrix"))
+    contribution <- contribution[signatureindex, sampleindex]
+    signatures <- signatures[, signatureindex]
+    total_signatures = colSums(signatures)
+    abs_contribution = contribution * total_signatures
+    m_contribution = melt(abs_contribution)
+    colnames(m_contribution) = c("Signature", "Sample", "Contribution")
+  }
+  return(m_contribution)
+}
+relative.dat <- contribution.input(nmf_res$contribution, sampleindex = order.sample, signatureindex = c("DNA Mismatch Repair", "POLE", "C>T_CpG"), mode = "relative")
+absolute.dat <- contribution.input(contribution = nmf_res$contribution, signatures = nmf_res$signatures, sampleindex = order.sample, signatureindex = c("DNA Mismatch Repair", "POLE", "C>T_CpG"), mode = "absolute")
+
+p2 <- ggplot(absolute.dat, aes(x = factor(Sample), y = Contribution, 
+                               fill = factor(Signature), order = Sample)) + 
+  geom_bar(stat = "identity") + 
+  scale_y_continuous(expand = c(0,0)) + scale_x_discrete(breaks = NULL) +
+  xlab("") + ylab("Number of mutations \n ") + 
+  scale_fill_manual(values = signature.col) + 
+  theme_classic() +
+  theme(legend.position = c(0.95, 0.7)) +
+  theme(legend.background = element_blank()) + theme(legend.key = element_blank()) +
+  guides(fill = guide_legend(title = NULL)) + 
+  ggtitle(paste0("Signature activity across ", ncol(nmf_res$contribution),
+                 "  TCGA LUAD cancers")) + 
+  theme(plot.title = element_text(hjust = 0.5, size = rel(1.5)))
+
+p3 <- ggplot(relative.dat, aes(x = factor(Sample), y = Contribution, fill = factor(Signature), order = Sample)) + geom_bar(stat = "identity", position = "fill") + 
+  scale_y_continuous(expand = c(0,0)) + scale_x_discrete(breaks = NULL) +
+  ylab("Normalized proportion \nof signature") + xlab("") +  
+  scale_fill_manual(values = signature.col) + theme_classic() +
+  theme(legend.position = "none")
+p2p3 <- plot_grid(p2, p3, align = "hv", ncol = 1)
+p1p2p3 <- plot_grid(p1, p2p3, labels = c("A", "B"), align = "hv", ncol = 1, rel_heights = c(3, 2))
+pdf("MutationPatterns.pdf", width = 12, height = 9)
+p1p2p3
+dev.off()
+
+######################################################
+####2.Mutational signature
+rmSilence = F 
+
+if (rmSilence) {
+  maf <- as.data.frame(maf[which(maf$Variant_Type == "SNP" & maf$Variant_Classification != "Silent"),]) #仅考虑SNP并移除沉默突变
+} else {
+  maf <- as.data.frame(maf[which(maf$Variant_Type == "SNP"),]) #
+}
+snp.count <- mut.to.sigs.input(mut.ref = maf, 
+                               sample.id = "Tumor_Sample_Barcode", 
+                               chr = "Chromosome", 
+                               pos = "Start_Position", 
+                               ref = "Reference_Allele", 
+                               alt = "Tumor_Seq_Allele2", 
+                               bsg = BSgenome.Hsapiens.UCSC.hg38) 
+write.table(snp.count,"snp.count.txt",sep = "\t",row.names = T,col.names = NA)
+cut.off <- 0.06 # 
+mut.wt <- data.frame()
+sigs.out.list <- list()
+index <- 1
+for (sample in rownames(snp.count)) {
+  cat(paste0(sample," starts and ",length(rownames(snp.count))-index," samples remain to be analyzed!\n"))
+  
+  tmp <- whichSignatures(tumor.ref = snp.count, 
+                         signatures.ref = signatures.cosmic, 
+                         sample.id = sample, 
+                         contexts.needed = TRUE,
+                         tri.counts.method = 'default', 
+                         signature.cutoff = cut.off)
+  index <- index + 1
+  sigs.out.list[[sample]] <- tmp
+  tmp <- data.frame(c(tmp$weights,unknown=tmp$unknown),row.names = sample)
+  mut.wt <- rbind.data.frame(mut.wt,tmp)
+}
+write.table(mut.wt,"mutsig.weightMatrix.txt",sep = "\t",row.names = T,col.names = NA)
+nmf.input <- t(mut.wt)
+nmf.input <- nmf.input[setdiff(rownames(nmf.input),"unknown"),]
+ranks <- 2:5
+estim <- lapply(ranks, function(r){
+  fit <- nmf(nmf.input, r, nrun = 50, seed = 4, method = "lee")
+  list(fit = fit, consensus = consensus(fit), .opt = "vp",coph = cophcor(fit))
+})
+names(estim) <- paste('rank', ranks)
+pdf("Cophenetic coefficient for seleting optimal nmf rank.pdf")
+par(cex.axis=1.5)
+plot(ranks, sapply(estim, '[[', 'coph'), xlab="", ylab="", type="b", col="red", lwd=4,xaxt="n")
+axis(side = 1, at=1:5)
+title(xlab="number of clusters", ylab="Cophenetic coefficient", cex.lab=1.5)
+invisible(dev.off())
+rank <- 3
+seed <- 2019620
+rownames(nmf.input) <- gsub("Signature","Sig",rownames(nmf.input))
+mut.nmf <- nmf(nmf.input, 
+               rank = rank, 
+               seed = seed, 
+               method = "lee") 
+index <- extractFeatures(mut.nmf,"max") 
+sig.order <- unlist(index)
+nmf.input2 <- nmf.input[sig.order,]
+mut.nmf2 <- nmf(nmf.input2, 
+                rank = rank, 
+                seed = seed, 
+                method = "lee") 
+group <- predict(mut.nmf2) 
+write.table(group,"group.txt",sep = "\t",row.names = T,col.names = NA)
+sample.order <- names(group[order(group)])
+pdf(file = "consensusmap.pdf",width = 4,height = 4)
+consensusmap(mut.nmf2,
+             labRow = NA,
+             labCol = NA,
+             annCol = data.frame("cluster"=group[colnames(nmf.input)]),
+             annColors = list(cluster=c("1"=jco[1],"2"=jco[2],"3"=jco[3],"4"=jco[4])))
+invisible(dev.off())
+pdf(file = "basismap.pdf",width = 4.5,height = 4)
+basismap(mut.nmf2,
+         cexCol = 1,
+         cexRow = 0.3,
+         annColors=list(c("1"=jco[1],"2"=jco[2],"3"=jco[3],"4"=jco[4])))
+invisible(dev.off())
+#nmf heatmap
+aheatmap(as.matrix(nmf.input2[,sample.order]), 
+         Rowv=NA, 
+         Colv=NA, 
+         annCol = data.frame("cluster"=group[sample.order]),
+         annColors = list(cluster=c("1"=jco[1],"2"=jco[2],"3"=jco[3],"4"=jco[4])),
+         color=c("#EAF0FA","#6081C3","#3454A7"), # 
+         revC=TRUE, 
+         cexCol = 0.3, 
+         cexRow = 0.3,
+         filename = "NMF_heatmap.pdf")
+
+
+##################################################
+#####3.consensus cluster
+expr <- read.table("easy_input_expr.txt",sep = "\t",row.names = 1,check.names = F,stringsAsFactors = F,header = T)
+exprdata <- log2(exprdata + 1) 
+exprdata <- scale(exprdata)
+subtype <- ConsensusClusterPlus(d = exprdata,
+                                maxK = 10, 
+                                pItem = 0.8, 
+                                pFeature = 1, 
+                                reps = 1000, 
+                                clusterAlg = "pam", 
+                                innerLinkage = "ward.D", 
+                                finalLinkage = "ward.D", 
+                                distance = "pearson", 
+                                seed = 123456,
+                                plot = "pdf", 
+                                writeTable = TRUE,
+                                title = "ConsensusCluster") 
+
